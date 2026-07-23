@@ -16,6 +16,7 @@
     nixosModules = import ./modules/nixos;
     darwinModules = import ./modules/nix-darwin;
     finixModules = import ./modules/finix;
+    standalone = import ./modules/standalone;
 
     packages = forAllSystems (system:
       import ./internal/packages.nix rec {
