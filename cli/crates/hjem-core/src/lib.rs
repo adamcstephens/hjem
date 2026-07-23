@@ -108,15 +108,17 @@ enum Command {
   },
   Activate {
     #[pound(long)]
-    manifest: PathBuf,
+    manifest:  PathBuf,
     #[pound(long)]
-    state:    PathBuf,
+    state:     PathBuf,
+    #[pound(long)]
+    no_reload: bool,
     #[pound(long, default = ".backup-")]
-    prefix:   String,
+    prefix:    String,
     #[pound(long)]
-    impure:   bool,
+    impure:    bool,
     #[pound(long)]
-    json:     bool,
+    json:      bool,
   },
 }
 
@@ -159,6 +161,8 @@ enum InternalCommand {
     state:             PathBuf,
     #[pound(long)]
     skip_state_update: bool,
+    #[pound(long)]
+    no_reload:         bool,
     #[pound(long)]
     actions_file:      Option<PathBuf>,
     #[pound(long, default = ".backup-")]
@@ -295,6 +299,8 @@ struct TriggerAction {
 struct ActivateResult {
   mode:    String,
   actions: Vec<TriggerAction>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  reload:  Option<ReloadResult>,
 }
 
 #[derive(Serialize)]
@@ -315,7 +321,7 @@ struct CleanupResult {
   removed: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct ReloadResult {
   skipped: bool,
   reason:  Option<String>,
@@ -344,6 +350,7 @@ impl Command {
       Command::Activate {
         manifest,
         state,
+        no_reload,
         prefix,
         impure,
         json,
@@ -353,6 +360,7 @@ impl Command {
           manifest,
           state,
           update_state: true,
+          reload: !no_reload,
           actions_file: None,
           prefix,
           impure,
@@ -510,6 +518,7 @@ impl InternalCommand {
         manifest,
         state,
         skip_state_update,
+        no_reload,
         actions_file,
         prefix,
         impure,
@@ -522,6 +531,7 @@ impl InternalCommand {
           manifest,
           state,
           update_state: !skip_state_update,
+          reload: !no_reload,
           actions_file,
           prefix,
           impure,
@@ -789,6 +799,7 @@ impl StandaloneCommand {
           manifest: target,
           state,
           update_state: true,
+          reload: true,
           actions_file: Some(base.join("current").join("actions.json")),
           prefix,
           impure,
@@ -948,6 +959,7 @@ fn standalone_switch_from_source(
     manifest: manifest.path.clone(),
     state,
     update_state: true,
+    reload: true,
     actions_file: Some(actions_file),
     prefix,
     impure,
@@ -993,6 +1005,7 @@ fn standalone_switch_rollback(
     manifest: target_manifest,
     state,
     update_state: true,
+    reload: true,
     actions_file: Some(base.join("current").join("actions.json")),
     prefix,
     impure,
@@ -1006,9 +1019,24 @@ fn standalone_switch_rollback(
   Ok(())
 }
 
+/// Narrows an evaluated value to the attributes the CLI consumes, mirroring the
+/// shapes 'extract_manifest_json' accepts. Applying this in Nix keeps anything
+/// else the value carries — a module 'config' or 'options', a 'toplevel'
+/// derivation — unforced, so it need not be JSON-serialisable.
+const MANIFEST_APPLY: &str = "v: if v ? version && v ? files then v else if v \
+                              ? manifest then { inherit (v) manifest; } // \
+                              (if v ? packages then { inherit (v) packages; } \
+                              else {}) else v";
+
 fn eval_nix_config(config_path: &Path, impure: bool) -> Result<Value, String> {
   let mut cmd = ProcCommand::new("nix");
-  cmd.arg("eval").arg("--json").arg("--file").arg(config_path);
+  cmd
+    .arg("eval")
+    .arg("--json")
+    .arg("--file")
+    .arg(config_path)
+    .arg("--apply")
+    .arg(MANIFEST_APPLY);
   if impure {
     cmd.arg("--impure");
   }
@@ -1031,18 +1059,27 @@ fn eval_nix_config(config_path: &Path, impure: bool) -> Result<Value, String> {
   serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())
 }
 
+fn current_user() -> String {
+  std::env::var("USER").unwrap_or_else(|_| "default".to_string())
+}
+
 fn eval_nix_flake(
   flake_ref: &str,
   flake_attr: Option<&str>,
   impure: bool,
 ) -> Result<Value, String> {
-  let user = std::env::var("USER").unwrap_or_else(|_| "default".to_string());
+  let user = current_user();
   let attr = flake_attr
     .map(str::to_string)
     .unwrap_or_else(|| format!("hjemConfigurations.\"{user}\""));
   let full_ref = format!("{flake_ref}#{attr}");
   let mut cmd = ProcCommand::new("nix");
-  cmd.arg("eval").arg("--json").arg(full_ref);
+  cmd
+    .arg("eval")
+    .arg("--json")
+    .arg(full_ref)
+    .arg("--apply")
+    .arg(MANIFEST_APPLY);
   if impure {
     cmd.arg("--impure");
   }
@@ -1123,6 +1160,7 @@ struct ActivateArgs {
   manifest:        PathBuf,
   state:           PathBuf,
   update_state:    bool,
+  reload:          bool,
   actions_file:    Option<PathBuf>,
   prefix:          String,
   impure:          bool,
@@ -1171,13 +1209,14 @@ impl ActivateArgs {
       atomic_copy(&self.manifest, &self.state)?;
     }
 
-    let result = ActivateResult {
+    let mut result = ActivateResult {
       mode: if had_state {
         "incremental".to_string()
       } else {
         "first".to_string()
       },
       actions,
+      reload: None,
     };
 
     if let Some(actions_file) = self.actions_file {
@@ -1191,10 +1230,21 @@ impl ActivateArgs {
       .map_err(|e| e.to_string())?;
     }
 
+    if self.reload {
+      result.reload =
+        Some(reload_systemd_user(&result.actions, &current_user())?);
+    }
+
     if self.json {
       print_json(&result)?;
     } else {
       println!("mode={}", result.mode);
+      if let Some(reload) = &result.reload {
+        match &reload.reason {
+          Some(reason) => println!("{reason}"),
+          None => println!("Applied {} systemd user action(s)", reload.applied),
+        }
+      }
     }
 
     Ok(())
@@ -1257,42 +1307,116 @@ struct ReloadActionsArgs {
   json:                    bool,
 }
 
+/// Returns the reason user systemd cannot be driven, or 'None' when it can.
+fn systemd_user_skip_reason(user: &str) -> Option<String> {
+  let output = ProcCommand::new("systemctl")
+    .args(["--user", "is-system-running"])
+    .output();
+
+  let output = match output {
+    Ok(output) => output,
+    Err(e) => {
+      return Some(format!(
+        "Could not query systemd user status for {user}: {e}"
+      ));
+    },
+  };
+
+  let running = String::from_utf8_lossy(&output.stdout).trim().to_string();
+  if running == "running" || running == "degraded" {
+    None
+  } else {
+    Some(format!(
+      "User systemd for {user} is not running (status: {running})"
+    ))
+  }
+}
+
+fn systemd_daemon_reload() -> Result<(), String> {
+  let status = ProcCommand::new("systemctl")
+    .args(["--user", "daemon-reload"])
+    .status()
+    .map_err(|e| {
+      format!("failed to run systemctl --user daemon-reload: {e}")
+    })?;
+  if status.success() {
+    Ok(())
+  } else {
+    Err("systemctl --user daemon-reload failed".to_string())
+  }
+}
+
+fn apply_trigger_actions(actions: &[TriggerAction]) -> Result<usize, String> {
+  let mut applied = 0usize;
+  for action in actions {
+    let mut cmd = ProcCommand::new("systemctl");
+    cmd.arg("--user");
+    match action.action.as_str() {
+      "restart" => {
+        cmd.arg("try-restart").arg(&action.unit);
+      },
+      "reload" => {
+        cmd.arg("reload-or-try-restart").arg(&action.unit);
+      },
+      _ => {
+        continue;
+      },
+    }
+
+    let status = cmd.status().map_err(|e| e.to_string())?;
+    if !status.success() {
+      warn!(
+        action.kind = %action.action,
+        systemd.unit = %action.unit,
+        "systemd action failed"
+      );
+    }
+    applied += 1;
+  }
+
+  Ok(applied)
+}
+
+fn reload_systemd_user(
+  actions: &[TriggerAction],
+  user: &str,
+) -> Result<ReloadResult, String> {
+  if let Some(reason) = systemd_user_skip_reason(user) {
+    return Ok(ReloadResult {
+      skipped: true,
+      reason:  Some(reason),
+      applied: 0,
+    });
+  }
+
+  systemd_daemon_reload()?;
+
+  Ok(ReloadResult {
+    skipped: false,
+    reason:  None,
+    applied: apply_trigger_actions(actions)?,
+  })
+}
+
 impl ReloadActionsArgs {
   fn run(self) -> Result<(), String> {
-    if self.require_running_systemd {
-      let status = ProcCommand::new("systemctl")
-        .args(["--user", "is-system-running"])
-        .output()
-        .map_err(|e| format!("failed to query systemd user status: {e}"))?;
-
-      let running = String::from_utf8_lossy(&status.stdout).trim().to_string();
-      if !(running == "running" || running == "degraded") {
-        let res = ReloadResult {
-          skipped: true,
-          reason:  Some(format!(
-            "User systemd for {} is not running (status: {running})",
-            self.user
-          )),
-          applied: 0,
-        };
-        if self.json {
-          print_json(&res)?;
-        } else if let Some(reason) = res.reason {
-          println!("{reason}");
-        }
-        return Ok(());
+    if self.require_running_systemd
+      && let Some(reason) = systemd_user_skip_reason(&self.user)
+    {
+      let res = ReloadResult {
+        skipped: true,
+        reason:  Some(reason),
+        applied: 0,
+      };
+      if self.json {
+        print_json(&res)?;
+      } else if let Some(reason) = res.reason {
+        println!("{reason}");
       }
+      return Ok(());
     }
 
-    let daemon_reload = ProcCommand::new("systemctl")
-      .args(["--user", "daemon-reload"])
-      .status()
-      .map_err(|e| {
-        format!("failed to run systemctl --user daemon-reload: {e}")
-      })?;
-    if !daemon_reload.success() {
-      return Err("systemctl --user daemon-reload failed".to_string());
-    }
+    systemd_daemon_reload()?;
 
     let actions =
       match (self.actions_file, self.old_manifest, self.new_manifest) {
@@ -1353,32 +1477,7 @@ impl ReloadActionsArgs {
         },
       };
 
-    let mut applied = 0usize;
-    for action in actions {
-      let mut cmd = ProcCommand::new("systemctl");
-      cmd.arg("--user");
-      match action.action.as_str() {
-        "restart" => {
-          cmd.arg("try-restart").arg(&action.unit);
-        },
-        "reload" => {
-          cmd.arg("reload-or-try-restart").arg(&action.unit);
-        },
-        _ => {
-          continue;
-        },
-      }
-
-      let status = cmd.status().map_err(|e| e.to_string())?;
-      if !status.success() {
-        warn!(
-          action.kind = %action.action,
-          systemd.unit = %action.unit,
-          "systemd action failed"
-        );
-      }
-      applied += 1;
-    }
+    let applied = apply_trigger_actions(&actions)?;
 
     if self.json {
       print_json(&ReloadResult {
@@ -2157,6 +2256,7 @@ mod tests {
         manifest:        manifest.clone(),
         state:           state.clone(),
         update_state:    true,
+        reload:          false,
         actions_file:    None,
         prefix:          ".backup-".to_owned(),
         impure:          false,

@@ -137,6 +137,7 @@ in {
                 --manifest "$new_manifest" \
                 --state "$old_manifest" \
                 --skip-state-update \
+                --no-reload \
                 ${linkerFlags} \
                 --json
             '';
