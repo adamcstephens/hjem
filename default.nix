@@ -15,5 +15,6 @@
   nixosModules = import ./modules/nixos;
   darwinModules = import ./modules/nix-darwin;
   finixModules = import ./modules/finix;
+  standalone = import ./modules/standalone;
   shell = import ./internal/shell.nix pkgs;
 }
