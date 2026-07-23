@@ -79,6 +79,110 @@ generation:
 Package support is not available for `--manifest`; manifest JSON remains a
 file-linking format and cannot represent Nix derivations.
 
+## Module-based configuration {#module-based-configuration}
+
+Writing the manifest by hand loses the ergonomics of Hjem's module system.
+`hjem.lib.hjemConfiguration` evaluates the same per-user options used by the
+NixOS, nix-darwin, and Finix modules — `files`, `xdg`, generators,
+`environment`, `packages`, and so on — for a single user, and returns
+`{ manifest; packages; toplevel; config; options; }`. The CLI reads `manifest`
+and `packages`; the rest is for you. It is unsystemised: the `pkgs` you pass in
+pins the system.
+
+```nix
+{
+  inputs.hjem.url = "github:feel-co/hjem";
+
+  outputs = { self, nixpkgs, hjem, ... }: {
+    hjemConfigurations.alice = hjem.lib.hjemConfiguration {
+      pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      modules = [ ./hjem.nix ];
+    };
+  };
+}
+```
+
+```nix
+# hjem.nix
+{ pkgs, ... }:
+{
+  user = "alice";
+
+  files.".foo".text = "bar";
+
+  xdg.config.files."app/config.json" = {
+    generator = pkgs.lib.generators.toJSON { };
+    value = { some = "contents"; };
+  };
+
+  packages = [ pkgs.hello ];
+}
+```
+
+`user` is required. `directory` defaults to `/home/<user>`, and `clobberFiles`
+defaults to `false`; both can be set in the module. Apply the result with:
+
+```sh
+hjem standalone switch --flake .
+```
+
+### systemd user units {#standalone-systemd-units}
+
+On Linux, the same `systemd` options the NixOS module exposes are available:
+`systemd.services`, `.timers`, `.sockets`, `.paths`, `.slices`, `.targets`, and
+`systemd.packages`. Units are rendered into
+`~/.config/systemd/user/`, along with the `.wants/`, `.requires/`, and
+`.upholds/` links implied by `wantedBy`, `requiredBy`, and `upheldBy`.
+
+```nix
+{ pkgs, config, ... }:
+{
+  user = "alice";
+
+  files.".config/example.conf".text = "answer=42";
+
+  systemd.services.example = {
+    description = "Example";
+    wantedBy = [ "default.target" ];
+    serviceConfig.ExecStart = "${pkgs.hello}/bin/hello";
+    restartTriggers = [ config.files.".config/example.conf".source ];
+  };
+}
+```
+
+`switch` runs `systemctl --user daemon-reload` and then restarts or reloads any
+unit whose `restartTriggers` or `reloadTriggers` changed. Pass
+`--no-reload` to `hjem activate` to skip that; when user systemd is not running,
+the reload is skipped with a message rather than failing.
+
+The unit options are evaluated with nixpkgs' NixOS systemd helpers, which are
+reached through `pkgs.path`. They are omitted entirely on non-Linux `pkgs`.
+
+### Realising the configuration {#realising-the-configuration}
+
+`hjemConfigurations."<USER>"` also carries a `toplevel` derivation that
+references every file source (through the manifest's string context) and every
+package. Building it realises the whole configuration into the store, and gives
+you a build artifact and a GC root:
+
+```sh
+nix build .#hjemConfigurations."alice".toplevel
+```
+
+### Introspection {#introspection}
+
+`config` and `options` expose the evaluated module system:
+
+```sh
+nix eval .#hjemConfigurations."alice".options.packages.description
+```
+
+They are not JSON-serialisable, which is fine: the CLI selects `manifest` and
+`packages` in Nix, so nothing else in the set is ever forced.
+
+For the rest of the `evalModules` result, such as `extendModules`, use
+`hjem.lib.evalStandalone` (same arguments).
+
 Use `--impure` only when that Nix evaluation requires impure builtins.
 
 ## Generations

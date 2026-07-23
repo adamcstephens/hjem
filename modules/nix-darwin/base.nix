@@ -83,6 +83,7 @@ in {
               ${hjemCli} internal activate \
                 --manifest "$NEW" \
                 --state "$CUR" \
+                --no-reload \
                 --actions-file "$STATE_DIR/actions.json" \
                 ${linkerFlags}
             '';
