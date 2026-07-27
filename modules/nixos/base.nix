@@ -8,14 +8,14 @@
   utils,
   ...
 }: let
-  inherit (builtins) attrNames attrValues concatLists concatMap concatStringsSep filter mapAttrs toJSON typeOf;
-  inherit (hjem-lib) fileToJson;
+  inherit (builtins) attrValues concatMap concatStringsSep filter mapAttrs;
+  inherit (hjem-lib) userFiles;
   inherit (lib.attrsets) filterAttrs optionalAttrs;
-  inherit (lib.modules) importApply mkDefault mkIf mkMerge;
+  inherit (lib.modules) importApply mkIf mkMerge;
   inherit (lib.strings) concatMapStringsSep optionalString;
-  inherit (lib.trivial) flip pipe;
-  inherit (lib.types) submoduleWith;
+  inherit (lib.trivial) pipe;
   inherit (lib.meta) getExe;
+  inherit (import ../common/lib.nix {inherit hjem-lib lib pkgs;}) mkHjemSubmodule mkLinkerFlags writeManifests;
 
   osConfig = config;
 
@@ -23,107 +23,28 @@
   _class = "nixos";
 
   enabledUsers = filterAttrs (_: u: u.enable) cfg.users;
-  disabledUsers = filterAttrs (_: u: !u.enable) cfg.users;
-
-  userFiles = user: [
-    user.files
-    user.xdg.cache.files
-    user.xdg.config.files
-    user.xdg.data.files
-    user.xdg.state.files
-  ];
 
   hjemCli = getExe hjem-package;
-  hjemPkg = hjem-package;
-  useExternalLinker = cfg.linker != hjemPkg;
-  linkerExe = getExe cfg.linker;
-  prefix =
-    if (typeOf cfg.linkerOptions == "set") && cfg.linkerOptions ? prefix
-    then cfg.linkerOptions.prefix
-    else ".backup-";
-  linkerArgFlags =
-    if !useExternalLinker
-    then ""
-    else if typeOf cfg.linkerOptions == "set"
-    then let
-      optsFile = pkgs.writeText "hjem-linker-options.json" (toJSON cfg.linkerOptions);
-    in ''--linker-arg --linker-opts --linker-arg ${optsFile}''
-    else concatMapStringsSep " " (arg: ''--linker-arg "${arg}"'') cfg.linkerOptions;
-  externalLinkerFlags =
-    if useExternalLinker
-    then ''--external-linker "${linkerExe}" ${linkerArgFlags}''
-    else "";
 
-  newManifests = let
-    writeManifest = user: let
-      name = "manifest-${user.user}.json";
-    in
-      pkgs.writeTextFile {
-        inherit name;
-        destination = "/${name}";
-        text = toJSON {
-          version = 3;
-          files = concatMap (
-            flip pipe [
-              attrValues
-              (filter (x: x.enable))
-              (map fileToJson)
-            ]
-          ) (userFiles user);
-        };
-        checkPhase = ''
-          set -e
-          CUE_CACHE_DIR=$(pwd)/.cache
-          CUE_CONFIG_DIR=$(pwd)/.config
+  linkerFlags = mkLinkerFlags {
+    inherit hjem-package;
+    inherit (cfg) linker linkerOptions;
+  };
 
-          ${getExe pkgs.cue} vet -c ${../../manifest/v3.cue} $target
-        '';
-      };
-  in
-    pkgs.symlinkJoin
-    {
-      name = "hjem-manifests";
-      paths = map writeManifest (attrValues enabledUsers);
-    };
+  newManifests = writeManifests (attrValues enabledUsers);
 
-  hjemSubmodule = submoduleWith {
+  hjemSubmodule = mkHjemSubmodule {
     description = "Hjem submodule for NixOS";
-    class = "hjem";
+    systemd = true;
     specialArgs =
       cfg.specialArgs
       // {
         inherit hjem-lib osConfig pkgs utils;
         osOptions = options;
       };
-    modules =
-      concatLists
-      [
-        [
-          ../common/user.nix
-          ./systemd.nix
-          ({
-            config,
-            name,
-            ...
-          }: let
-            user = osConfig.users.users.${name};
-          in {
-            assertions = [
-              {
-                assertion = config.enable -> user.enable;
-                message = "Enabled Hjem user '${name}' must also be configured and enabled in NixOS.";
-              }
-            ];
-
-            user = mkDefault user.name;
-            directory = mkDefault user.home;
-            clobberFiles = mkDefault cfg.clobberByDefault;
-          })
-        ]
-        # Evaluate additional modules under 'hjem.users.<username>' so that
-        # module systems built on Hjem are more ergonomic.
-        cfg.extraModules
-      ];
+    # Evaluate additional modules under 'hjem.users.<username>' so that
+    # module systems built on Hjem are more ergonomic.
+    modules = cfg.extraModules;
   };
 in {
   inherit _class;
@@ -216,8 +137,7 @@ in {
                 --manifest "$new_manifest" \
                 --state "$old_manifest" \
                 --skip-state-update \
-                --prefix "${prefix}" \
-                ${externalLinkerFlags} \
+                ${linkerFlags} \
                 --json
             '';
           };

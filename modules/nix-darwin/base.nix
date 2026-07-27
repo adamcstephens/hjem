@@ -7,84 +7,32 @@
   hjem-package,
   ...
 }: let
-  inherit (builtins) attrValues concatLists concatMap filter getAttr head isAttrs toJSON;
-  inherit (hjem-lib) fileToJson;
+  inherit (builtins) attrValues concatMap;
   inherit (lib.attrsets) filterAttrs;
   inherit (lib.meta) getExe getExe';
   inherit (lib.modules) importApply mkAfter mkDefault;
-  inherit (lib.strings) concatLines concatMapAttrsStringSep concatMapStringsSep;
-  inherit (lib.trivial) flip pipe;
-  inherit (lib.types) submoduleWith;
+  inherit (lib.strings) concatLines concatMapAttrsStringSep;
+  inherit (import ../common/lib.nix {inherit hjem-lib lib pkgs;}) mkHjemSubmodule mkLinkerFlags writeManifests;
 
   cfg = config.hjem;
   _class = "darwin";
 
   enabledUsers = filterAttrs (_: u: u.enable) cfg.users;
 
-  userFiles = user: [
-    user.files
-    user.xdg.cache.files
-    user.xdg.config.files
-    user.xdg.data.files
-    user.xdg.state.files
-  ];
-
   hjemCli = getExe hjem-package;
-  hjemPkg = hjem-package;
-  useExternalLinker = cfg.linker != hjemPkg;
-  linkerExe = getExe cfg.linker;
-  prefix =
-    if isAttrs cfg.linkerOptions && cfg.linkerOptions ? prefix
-    then cfg.linkerOptions.prefix
-    else ".backup-";
-  linkerArgFlags =
-    if !useExternalLinker
-    then ""
-    else if isAttrs cfg.linkerOptions
-    then let
-      optsFile = pkgs.writeText "hjem-linker-options.json" (toJSON cfg.linkerOptions);
-    in ''--linker-arg --linker-opts --linker-arg ${optsFile}''
-    else concatMapStringsSep " " (arg: ''--linker-arg "${arg}"'') cfg.linkerOptions;
-  externalLinkerFlags =
-    if useExternalLinker
-    then ''--external-linker "${linkerExe}" ${linkerArgFlags}''
-    else "";
 
-  newManifests = let
-    writeManifest = user: let
-      name = "manifest-${user.user}.json";
-    in
-      pkgs.writeTextFile {
-        inherit name;
-        destination = "/${name}";
-        text = toJSON {
-          version = 3;
-          files = concatMap (
-            flip pipe [
-              attrValues
-              (filter (x: x.enable))
-              (map fileToJson)
-            ]
-          ) (userFiles user);
-        };
-        checkPhase = ''
-          set -e
-          CUE_CACHE_DIR=$(pwd)/.cache
-          CUE_CONFIG_DIR=$(pwd)/.config
+  linkerFlags = mkLinkerFlags {
+    inherit hjem-package;
+    inherit (cfg) linker linkerOptions;
+  };
 
-          ${getExe pkgs.cue} vet -c ${../../manifest/v3.cue} $target
-        '';
-      };
-  in
-    pkgs.symlinkJoin
-    {
-      name = "hjem-manifests";
-      paths = map writeManifest (attrValues enabledUsers);
-    };
+  newManifests = writeManifests (attrValues enabledUsers);
 
-  hjemSubmodule = submoduleWith {
+  hjemSubmodule = mkHjemSubmodule {
     description = "Hjem submodule for nix-darwin";
-    class = "hjem";
+    # Darwin has no systemd to render user units for.
+    systemd = false;
+    assertHostUserEnabled = false;
     specialArgs =
       cfg.specialArgs
       // {
@@ -92,23 +40,9 @@
         osConfig = config;
         osOptions = options;
       };
-    modules =
-      concatLists
-      [
-        [
-          ../common/user.nix
-          ({name, ...}: let
-            user = getAttr name config.users.users;
-          in {
-            user = mkDefault user.name;
-            directory = mkDefault user.home;
-            clobberFiles = mkDefault cfg.clobberByDefault;
-          })
-        ]
-        # Evaluate additional modules under 'hjem.users.<username>' so that
-        # module systems built on Hjem are more ergonomic.
-        cfg.extraModules
-      ];
+    # Evaluate additional modules under 'hjem.users.<username>' so that
+    # module systems built on Hjem are more ergonomic.
+    modules = cfg.extraModules;
   };
 in {
   imports = [
@@ -150,8 +84,7 @@ in {
                 --manifest "$NEW" \
                 --state "$CUR" \
                 --actions-file "$STATE_DIR/actions.json" \
-                --prefix "${prefix}" \
-                ${externalLinkerFlags}
+                ${linkerFlags}
             '';
           });
           Label = "org.hjem.activate";
