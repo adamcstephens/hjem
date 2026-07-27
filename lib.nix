@@ -49,6 +49,16 @@ in rec {
         ;
     };
 
+  # Every file-holding option of a Hjem user, in the order they are written to
+  # the manifest.
+  userFiles = user: [
+    user.files
+    user.xdg.cache.files
+    user.xdg.config.files
+    user.xdg.data.files
+    user.xdg.state.files
+  ];
+
   fileTypeRelativeTo = {
     rootDir,
     clobberDefault,
