@@ -26,7 +26,10 @@
       [
         {
           user = "alice";
-          files.".config/hjem-standalone-check".text = "Hello standalone!";
+          files = {
+            ".config/hjem-standalone-check".text = "Hello standalone!";
+            ".config/hjem-standalone-source-check".source = ./checks.nix;
+          };
           packages = [pkgs.hello];
         }
       ]
@@ -51,17 +54,28 @@
     // {
       standalone = let
         toplevel = standaloneConfiguration.toplevel;
+
+        # The standalone CLI reads 'manifest' through 'nix eval --json', which
+        # prints path values verbatim instead of copying them to the store, so
+        # every source has to be a store path string by the time it lands there.
+        unrealised =
+          builtins.filter
+          (file: file ? source && !(builtins.isString file.source && builtins.hasContext file.source))
+          standaloneConfiguration.manifest.files;
       in
-        pkgs.runCommandLocal "hjem-standalone-check" {} ''
-          set -e
-          grep -q '/home/alice/.config/hjem-standalone-check' ${toplevel}/manifest.json
-          ${pkgs.lib.optionalString isLinux ''
-            grep -q 'systemd/user/hjem-standalone-check.service' ${toplevel}/manifest.json
-            grep -q 'systemd/user/default.target.wants/hjem-standalone-check.service' ${toplevel}/manifest.json
-          ''}
-          test -x ${toplevel}/sw/bin/hello
-          touch $out
-        '';
+        assert pkgs.lib.assertMsg (unrealised == [])
+        "manifest sources are not realised store paths: ${toString (map (file: file.target) unrealised)}";
+          pkgs.runCommandLocal "hjem-standalone-check" {} ''
+            set -e
+            grep -q '/home/alice/.config/hjem-standalone-check' ${toplevel}/manifest.json
+            grep -q '/home/alice/.config/hjem-standalone-source-check' ${toplevel}/manifest.json
+            ${pkgs.lib.optionalString isLinux ''
+              grep -q 'systemd/user/hjem-standalone-check.service' ${toplevel}/manifest.json
+              grep -q 'systemd/user/default.target.wants/hjem-standalone-check.service' ${toplevel}/manifest.json
+            ''}
+            test -x ${toplevel}/sw/bin/hello
+            touch $out
+          '';
 
       # Formatting checks to run as a part of 'nix flake check' or manually
       # via 'nix build .#checks.<system>.formatting'.
