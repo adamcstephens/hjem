@@ -35,6 +35,10 @@ in rec {
 
   listOrSingletonOf = type: coercedTo (either (listOf type) type) toList (listOf type);
 
+  # Interpolating 'source' copies path values into the store while evaluating,
+  # which 'builtins.toJSON' would otherwise only do when rendering the manifest
+  # inside a derivation. Without it, 'nix eval --json' of a manifest yields
+  # paths that were never realised.
   fileToJson = f:
     filterAttrs (_: v: v != null) {
       inherit
@@ -42,11 +46,14 @@ in rec {
         clobber
         gid
         permissions
-        source
         target
         type
         uid
         ;
+      source =
+        if f.source == null
+        then null
+        else "${f.source}";
     };
 
   # Every file-holding option of a Hjem user, in the order they are written to
