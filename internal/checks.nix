@@ -69,6 +69,7 @@
             set -e
             grep -q '/home/alice/.config/hjem-standalone-check' ${toplevel}/manifest.json
             grep -q '/home/alice/.config/hjem-standalone-source-check' ${toplevel}/manifest.json
+            grep -q '${pkgs.hello}' ${toplevel}/packages.json
             ${pkgs.lib.optionalString isLinux ''
               grep -q 'systemd/user/hjem-standalone-check.service' ${toplevel}/manifest.json
               grep -q 'systemd/user/default.target.wants/hjem-standalone-check.service' ${toplevel}/manifest.json

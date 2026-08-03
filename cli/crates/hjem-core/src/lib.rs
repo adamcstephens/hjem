@@ -862,9 +862,19 @@ impl StandaloneCommand {
 }
 
 struct ResolvedManifest {
-  path:      PathBuf,
-  packages:  Vec<PathBuf>,
-  _temp_dir: Option<PathBuf>,
+  path:     PathBuf,
+  packages: Vec<PathBuf>,
+  temp_dir: Option<PathBuf>,
+}
+
+// The build out-link lives in the temporary directory, so it holds a GC root
+// over every source and package for as long as the manifest is in use.
+impl Drop for ResolvedManifest {
+  fn drop(&mut self) {
+    if let Some(dir) = &self.temp_dir {
+      let _ = fs::remove_dir_all(dir);
+    }
+  }
 }
 
 enum StandaloneSource {
@@ -903,9 +913,9 @@ impl StandaloneSource {
     let json = match self {
       Self::Manifest(path) => {
         return Ok(ResolvedManifest {
-          path:      path.clone(),
-          packages:  Vec::new(),
-          _temp_dir: None,
+          path:     path.clone(),
+          packages: Vec::new(),
+          temp_dir: None,
         });
       },
       Self::Config(path) => eval_nix_config(path, impure)?,
@@ -913,10 +923,16 @@ impl StandaloneSource {
         let flake = path
           .to_str()
           .ok_or_else(|| "Invalid flake path".to_string())?;
-        eval_nix_flake(flake, None, impure)?
+        match build_flake_toplevel(flake, None, impure)? {
+          Some(resolved) => return Ok(resolved),
+          None => eval_nix_flake(flake, None, impure)?,
+        }
       },
       Self::FlakeWithAttr(flake, attr) => {
-        eval_nix_flake(flake, attr.as_deref(), impure)?
+        match build_flake_toplevel(flake, attr.as_deref(), impure)? {
+          Some(resolved) => return Ok(resolved),
+          None => eval_nix_flake(flake, attr.as_deref(), impure)?,
+        }
       },
     };
 
@@ -933,7 +949,7 @@ impl StandaloneSource {
     Ok(ResolvedManifest {
       path,
       packages,
-      _temp_dir: Some(temp_dir),
+      temp_dir: Some(temp_dir),
     })
   }
 }
@@ -1063,15 +1079,122 @@ fn current_user() -> String {
   std::env::var("USER").unwrap_or_else(|_| "default".to_string())
 }
 
+fn flake_attr_name(flake_attr: Option<&str>) -> String {
+  flake_attr.map(str::to_string).unwrap_or_else(|| {
+    let user = current_user();
+    format!("hjemConfigurations.\"{user}\"")
+  })
+}
+
+/// Builds the configuration's `toplevel` and reads the manifest and package
+/// list out of the result.
+///
+/// Evaluation copies path values into the store but cannot build derivations,
+/// so a manifest obtained through `nix eval` names sources and packages that
+/// may not exist yet. Building `toplevel` realises all of them, and the
+/// out-link is a GC root over the lot.
+///
+/// Returns `None` when the attribute carries no `toplevel`, as a hand-written
+/// manifest attribute set does; the caller falls back to evaluation.
+fn build_flake_toplevel(
+  flake_ref: &str,
+  flake_attr: Option<&str>,
+  impure: bool,
+) -> Result<Option<ResolvedManifest>, String> {
+  let attr = flake_attr_name(flake_attr);
+  let installable = format!("{flake_ref}#{attr}");
+  if !flake_has_toplevel(&installable, impure)? {
+    return Ok(None);
+  }
+
+  let temp_dir = mk_temp_dir("hjem-manifest-build")?;
+  let out_link = temp_dir.join("result");
+  let mut cmd = ProcCommand::new("nix");
+  cmd
+    .arg("build")
+    .arg(format!("{installable}.toplevel"))
+    .arg("--out-link")
+    .arg(&out_link);
+  if impure {
+    cmd.arg("--impure");
+  }
+  let output = cmd.output().map_err(|e| {
+    format!(
+      "failed to execute 'nix build' for flake '{flake_ref}': {e}. Ensure Nix \
+       is installed and available in PATH"
+    )
+  })?;
+  if !output.status.success() {
+    return Err(format!(
+      "nix build failed for '{}.toplevel': {}",
+      installable,
+      String::from_utf8_lossy(&output.stderr)
+    ));
+  }
+
+  let manifest = out_link.join("manifest.json");
+  if !manifest.exists() {
+    return Err(format!(
+      "'{installable}.toplevel' does not expose 'manifest.json'"
+    ));
+  }
+  let packages = read_toplevel_packages(&out_link.join("packages.json"))?;
+
+  Ok(Some(ResolvedManifest {
+    path: manifest,
+    packages,
+    temp_dir: Some(temp_dir),
+  }))
+}
+
+fn flake_has_toplevel(installable: &str, impure: bool) -> Result<bool, String> {
+  let mut cmd = ProcCommand::new("nix");
+  cmd
+    .arg("eval")
+    .arg("--json")
+    .arg(installable)
+    .arg("--apply")
+    .arg("v: v ? toplevel");
+  if impure {
+    cmd.arg("--impure");
+  }
+  let output = cmd.output().map_err(|e| {
+    format!(
+      "failed to execute 'nix eval' for '{installable}': {e}. Ensure Nix is \
+       installed and available in PATH"
+    )
+  })?;
+  if !output.status.success() {
+    return Err(format!(
+      "nix eval failed for '{}': {}\nHint: verify the flake output attr exists",
+      installable,
+      String::from_utf8_lossy(&output.stderr)
+    ));
+  }
+  serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())
+}
+
+fn read_toplevel_packages(path: &Path) -> Result<Vec<PathBuf>, String> {
+  let contents = fs::read(path).map_err(|e| {
+    format!(
+      "failed to read '{}': {e}\nHint: 'toplevel' must expose 'packages.json' \
+       alongside 'manifest.json'",
+      path.display()
+    )
+  })?;
+  let packages: Vec<String> =
+    serde_json::from_slice(&contents).map_err(|e| {
+      format!("'{}' is not a list of store paths: {e}", path.display())
+    })?;
+  Ok(packages.into_iter().map(PathBuf::from).collect())
+}
+
 fn eval_nix_flake(
   flake_ref: &str,
   flake_attr: Option<&str>,
   impure: bool,
 ) -> Result<Value, String> {
-  let user = current_user();
-  let attr = flake_attr
-    .map(str::to_string)
-    .unwrap_or_else(|| format!("hjemConfigurations.\"{user}\""));
+  let attr = flake_attr_name(flake_attr);
   let full_ref = format!("{flake_ref}#{attr}");
   let mut cmd = ProcCommand::new("nix");
   cmd
