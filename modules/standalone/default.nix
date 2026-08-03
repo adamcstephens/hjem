@@ -12,14 +12,16 @@
 # 'hjemConfiguration' returns
 # '{ manifest; packages; toplevel; config; options; }'.
 #
-#   - 'manifest' and 'packages' are what the standalone CLI reads from
-#     'hjemConfigurations."<USER>"'. It selects them in Nix, so the rest of this
-#     set is never forced and need not be JSON-serialisable.
-#   - 'toplevel' is a derivation that references every file source (through the
-#     manifest's string context) and every package, so
-#     'nix build .#hjemConfigurations."<USER>".toplevel' realises the whole
-#     configuration into the store. It exposes 'manifest.json' at its root and
-#     the packages merged under 'sw/'.
+#   - 'toplevel' is what the standalone CLI builds. It references every file
+#     source (through the manifest's string context) and every package, so
+#     building it realises the whole configuration into the store, and the
+#     resulting out-link is a GC root for all of it. It exposes 'manifest.json'
+#     and 'packages.json' at its root, and the packages merged under 'sw/'.
+#   - 'manifest' and 'packages' describe the same configuration as a plain
+#     value, for inspection and for linkers driven by 'nix eval'. Evaluation
+#     cannot build derivations, so sources and packages that are derivation
+#     outputs are named but not realised; only 'toplevel' guarantees they
+#     exist.
 #   - 'config' and 'options' are the evaluated module system, for introspection.
 #
 # 'evalStandalone' returns the full 'evalModules' result extended with the
@@ -75,6 +77,10 @@ let
       destination = "/manifest.json";
     };
 
+    packages = map (p: "${p}") cfg.packages;
+
+    packagesFile = pkgs.writeText "packages.json" (builtins.toJSON packages);
+
     sw = pkgs.buildEnv {
       name = "hjem-standalone-sw-${cfg.user}";
       paths = cfg.packages;
@@ -83,13 +89,13 @@ let
     toplevel = pkgs.runCommandLocal "hjem-standalone-${cfg.user}" {} ''
       mkdir -p $out
       ln -s ${manifestFile}/manifest.json $out/manifest.json
+      ln -s ${packagesFile} $out/packages.json
       ln -s ${sw} $out/sw
     '';
   in
     eval
     // {
-      inherit manifest toplevel;
-      packages = map (p: "${p}") cfg.packages;
+      inherit manifest packages toplevel;
     };
 
   hjemConfiguration = args: {

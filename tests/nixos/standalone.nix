@@ -74,6 +74,39 @@
       };
     }
   '';
+
+  # A configuration exposing 'toplevel' is built rather than evaluated, so its
+  # manifest and packages are read out of the build result. 'toplevel' is a
+  # directory rather than a derivation because a derivation written into a
+  # flake this way would name its builder without string context, leaving the
+  # sandbox nothing to run.
+  toplevelSource = pkgs.writeText "hjem-standalone-toplevel-source" "Hello toplevel!";
+  packageThree = pkgs.writeShellScriptBin "hjem-package-three" ''
+    echo package-three
+  '';
+  toplevelManifest = (pkgs.formats.json {}).generate "hjem-standalone-toplevel-manifest.json" {
+    version = 3;
+    files = [
+      {
+        type = "symlink";
+        source = "${toplevelSource}";
+        target = "${userHome}/.config/standalone-test";
+      }
+    ];
+  };
+  toplevelPackages = (pkgs.formats.json {}).generate "hjem-standalone-toplevel-packages.json" ["${packageThree}"];
+  toplevelFlakeDir = pkgs.runCommand "hjem-standalone-toplevel-flake" {} ''
+    mkdir -p $out/toplevel
+    cp ${toplevelManifest} $out/toplevel/manifest.json
+    cp ${toplevelPackages} $out/toplevel/packages.json
+    cat >$out/flake.nix <<'EOF'
+    {
+      outputs = { self }: {
+        hjemConfigurations.${user}.toplevel = ./toplevel;
+      };
+    }
+    EOF
+  '';
 in
   hjemTest {
     name = "hjem-standalone";
@@ -104,6 +137,7 @@ in
             "hjem-standalone.nix".source = configFile;
             "hjem-standalone-alternate.nix".source = alternateConfigFile;
             "hjem-standalone-flake".source = flakeDir;
+            "hjem-standalone-toplevel-flake".source = toplevelFlakeDir;
           };
         };
       };
@@ -170,6 +204,11 @@ in
         machine.succeed("su - ${user} -c 'hjem standalone init --dir ~/.config/hjem-init-test --switch --no-flake'")
         machine.succeed("test -L ${userHome}/.config/example")
         machine.succeed("grep -q 'Example Hjem standalone configuration.' ${userHome}/.config/example")
+
+      with subtest("Standalone switch builds flake toplevels"):
+        machine.succeed("su - ${user} -c 'hjem standalone switch --flake /etc/hjem-standalone-toplevel-flake'")
+        machine.succeed("grep -q 'Hello toplevel!' ${userHome}/.config/standalone-test")
+        machine.succeed("su - ${user} -c 'test \"$(~/.local/state/hjem/standalone/current-profile/bin/hjem-package-three)\" = package-three'")
 
       with subtest("Standalone generation roots retain and release linked files"):
         source = machine.succeed(

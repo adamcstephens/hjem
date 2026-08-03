@@ -30,8 +30,19 @@ Pass `--switch` to `init` to apply the generated configuration immediately, or
 
 - `--manifest PATH` reads an already-generated manifest JSON file.
 - `--config PATH` evaluates a Nix expression such as `hjem.nix`.
-- `--flake REF` evaluates a flake output. By default this is
+- `--flake REF` reads a flake output. By default this is
   `hjemConfigurations."$USER"`; use `--flake-attr` to select another output.
+
+A flake output carrying a `toplevel` attribute, as `hjemConfiguration` produces,
+is **built** rather than evaluated, and its `manifest.json` and `packages.json`
+are read from the result. Evaluation alone copies path values into the store but
+cannot build derivations, so sources and packages produced by a derivation —
+anything from `text`, a `generator`, or a package — would otherwise be named but
+never realised. Building also makes the out-link a GC root over the whole
+configuration.
+
+Outputs without a `toplevel`, such as a hand-written manifest attribute set, are
+evaluated as before. Their sources must already exist in the store.
 
 The Nix value may be either the manifest itself or an attribute set containing
 `manifest`. A manifest has a version and a list of files, for example:
@@ -160,14 +171,18 @@ reached through `pkgs.path`. They are omitted entirely on non-Linux `pkgs`.
 
 ### Realising the configuration {#realising-the-configuration}
 
-`hjemConfigurations."<USER>"` also carries a `toplevel` derivation that
-references every file source (through the manifest's string context) and every
-package. Building it realises the whole configuration into the store, and gives
-you a build artifact and a GC root:
+`hjemConfigurations."<USER>"` carries a `toplevel` derivation that references
+every file source (through the manifest's string context) and every package.
+Building it realises the whole configuration into the store, and gives you a
+build artifact and a GC root:
 
 ```sh
 nix build .#hjemConfigurations."alice".toplevel
 ```
+
+This is what `switch` and `build` do for you; running it by hand is useful to
+inspect the result, which exposes `manifest.json`, `packages.json` and the
+merged packages under `sw/`.
 
 ### Introspection {#introspection}
 
@@ -177,8 +192,9 @@ nix build .#hjemConfigurations."alice".toplevel
 nix eval .#hjemConfigurations."alice".options.packages.description
 ```
 
-They are not JSON-serialisable, which is fine: the CLI selects `manifest` and
-`packages` in Nix, so nothing else in the set is ever forced.
+They are not JSON-serialisable, which is fine: the CLI builds `toplevel`, or
+selects `manifest` and `packages` in Nix, so nothing else in the set is ever
+forced.
 
 For the rest of the `evalModules` result, such as `extendModules`, use
 `hjem.lib.evalStandalone` (same arguments).

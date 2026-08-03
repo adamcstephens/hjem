@@ -45,7 +45,9 @@ $ hjem activate   --manifest <path> --state <path>
 
 `standalone switch` and `standalone build` accept exactly one manifest source:
 `--manifest` (pre-generated JSON), `--config` (a `hjem.nix` evaluated with
-`nix eval`), or `--flake` (defaulting to `hjemConfigurations."$USER"`). State
+`nix eval`), or `--flake` (defaulting to `hjemConfigurations."$USER"`). A flake
+output carrying a `toplevel` is built with `nix build`, which realises its
+sources and packages and roots them; one without is evaluated instead. State
 lives in `$XDG_STATE_HOME/hjem/standalone`, or `~/.local/state/hjem/standalone`
 when unset; `--state-dir` overrides it.
 
