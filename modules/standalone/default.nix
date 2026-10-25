@@ -45,6 +45,12 @@ let
       inherit lib pkgs;
       config.systemd = {
         package = pkgs.systemd;
+        defaultPath = [
+          pkgs.coreutils
+          pkgs.findutils
+          pkgs.gnugrep
+          pkgs.systemd
+        ];
         globalEnvironment = {};
         enableStrictShellChecks = false;
       };
